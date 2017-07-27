@@ -18,6 +18,8 @@ class InstagramScraper:
     QUERY_URL = 'https://www.instagram.com/graphql/query/' \
                 '?query_id=17888483320059182&variables={"id":"%s","first":%d,"after":"%s"}'
 
+    VIDEO_JSON = 'https://www.instagram.com/p/{short_code}/?__a=1'
+
     HEADERS = {
         'Connection': 'keep-alive',
         'Cache-Control': 'max-age=0',
@@ -38,10 +40,11 @@ class InstagramScraper:
 
     logging.basicConfig(filename='logger.log')
 
-    def __init__(self, user_name, path, max_num, thread, use_proxy):
+    def __init__(self, user_name, path, max_num, enable_video, thread, use_proxy):
         self.url = self.BASE_URL.format(user_name)
         self.path = path
         self.max_num = max_num
+        self.enable_video = enable_video
         # make dirs
         self.profile_path = os.path.join(path, 'UserProfile')
         if os.path.isdir(path):
@@ -88,9 +91,13 @@ class InstagramScraper:
             self.profile = json.loads(json_str)['entry_data']['ProfilePage'][0]['user']
             media = self.profile.get('media', {})
             query = [{'url': node.get('display_src'),
-                       'is_video': node.get('is_video', False),
-                       'time': int(node.get('date', time.time())),
-                       'caption': node.get('caption', time.time())} for node in media.get('nodes', [{}])]
+                      'is_video': node.get('is_video', False),
+                      'short_code': node.get('code', ''),
+                      'time': int(node.get('date', time.time())),
+                      'caption': node.get('caption', time.time())} for node in media.get('nodes', [{}])]
+            if self.enable_video:
+                vedio_targets = [self.get_vedio_target(target) for target in query if target['is_video']]
+                query.extend(vedio_targets)
             for target in query:
                 self.queue.put(target)
                 if self.last_end_url == -1:
@@ -146,17 +153,32 @@ class InstagramScraper:
         with open(os.path.join(self.profile_path, 'UserProfile.json'), 'w') as fp:
             fp.write(profile_str)
 
-    def parse_json(self, content):
-        data = json.loads(content).get('data').get('user').get('edge_owner_to_timeline_media')
+    def parse_json_1(self, text):
+        data = json.loads(text).get('data').get('user').get('edge_owner_to_timeline_media')
         self.end_cursor = data.get('page_info').get('end_cursor')
         self.has_next_page = data.get('page_info').get('has_next_page')
         query = [
             {'url': node.get('node').get('display_url', ''),
              'is_video': node.get('node').get('is_video', False),
+             'short_code': node.get('node').get('shortcode', ''),
              'time': int(node.get('node').get('taken_at_timestamp', time.time())),
              'caption': node.get('node').get('edge_media_to_caption').get('edges', [{}])[0].get('node').get('text', time.time())
              } for node in data.get('edges')]
         return query
+
+    def parse_json_2(self, text):
+        return json.loads(text).get('graphql').get('shortcode_media').get('video_url')
+
+    def get_vedio_target(self, target):
+        """Get vedio target from image target"""
+        json_url = self.VIDEO_JSON.format(short_code=target['short_code'])
+        res = self.request(json_url)
+        vedio_tar = target
+        vedio_tar['url'] = self.parse_json_2(res.text)
+        return vedio_tar
+
+    def request(self, url):
+        return requests.get(url, cookies=self.cookies, headers=self.HEADERS, proxies=self.proxies)
 
     def get_next_query(self):
         """Get more query"""
@@ -164,10 +186,13 @@ class InstagramScraper:
             try:
                 if self.has_next_page and not self.stop_parsing:
                     url = self.QUERY_URL % (self.uid, self.query_num, self.end_cursor)
-                    response = requests.get(url, cookies=self.cookies, headers=self.HEADERS, proxies=self.proxies)
-                    query = self.parse_json(response.text)
+                    response = self.request(url)
+                    query = self.parse_json_1(response.text)
                     for target in query:
                         if self.count.qsize() < self.max_num:
+                            if self.enable_video and target['is_video']:
+                                # 如果是视频则同时将视频加入队列
+                                self.queue.put(self.get_vedio_target(target))
                             self.queue.put(target)
                             # 如果上次下载到了用户的最后一张照片，则这次只下载到上次开始的地方
                             if self.profile.get('LastEndUrl', '') == -1:
@@ -193,7 +218,7 @@ class InstagramScraper:
                 pass
         self.stop()
 
-    def download_img(self):
+    def download(self):
         """Download target in queue"""
         while self.count.qsize() <= self.max_num:
             try:
@@ -204,7 +229,7 @@ class InstagramScraper:
                         filename = filename.replace(r, '_')
                     filepath = os.path.join(self.path, filename)
                     if not os.path.isfile(filepath):
-                        response = requests.get(target['url'], headers=self.HEADERS, proxies=self.proxies)
+                        response = self.request(target['url'])
                         if response.status_code == 200:
                             with open(filepath, 'wb') as fp:
                                 fp.write(response.content)
@@ -225,7 +250,7 @@ class InstagramScraper:
             self.downloaders = []
             get_query = Process(target=self.get_next_query)
             for i in range(self.thread):
-                self.downloaders.append(Process(target=self.download_img))
+                self.downloaders.append(Process(target=self.download))
             get_query.start()
             for downloader in self.downloaders:
                 downloader.start()
@@ -248,10 +273,11 @@ if __name__ == '__main__':
     parser = optparse.OptionParser()
     parser.add_option('--user', '-u', default='', help='User name to download')
     parser.add_option('--path', '-p', default='', help='Path to save images(default: ./<user>')
-    parser.add_option('--num', '-n', default=100, help='Max number to download(set -1 to download all)')
+    parser.add_option('--num', '-n', default=100, help='Max number to download')
+    parser.add_option('--video', '-v', action='store_true', default=False, help='Enable downloading video(default: off)')
     parser.add_option('--thread', '-t', default=4, help='Download thread(s).(Do not set it over 10!)')
     parser.add_option('--proxy', '-P', action='store_true', default=False,
-                      help='Use proxy(default proxy: http://127.0.0.1:1080)')
+                      help='Use proxy(default: off AND default proxy: http://127.0.0.1:1080)')
     opts, args = parser.parse_args()
     if not opts.user:
         print('Please set user to scrap!')
@@ -259,10 +285,10 @@ if __name__ == '__main__':
         sys.exit(2)
     if not opts.path:
         opts.path = './' + opts.user
-    if opts.thread > 20:
+    if int(opts.thread) > 20:
         opts.thread = 20
 
-    scraper = InstagramScraper(user_name=opts.user, path=opts.path, max_num=int(opts.num),
+    scraper = InstagramScraper(user_name=opts.user, path=opts.path, max_num=int(opts.num), enable_video=opts.video,
                                thread=int(opts.thread), use_proxy=opts.proxy)
 
     # change encode if on Windows
@@ -293,8 +319,9 @@ if __name__ == '__main__':
     Scrap info:
         Path to save: {0}
         Max download numbers: {1}
-        Downloader thread: {2}
-        User proxy: {3}
-    '''.format(opts.path, opts.num, opts.thread, opts.proxy))
+        Download video: {2}
+        Downloader thread: {3}
+        User proxy: {4}
+    '''.format(opts.path, opts.num, opts.video, opts.thread, opts.proxy))
 
     scraper.run()
